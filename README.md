@@ -172,6 +172,10 @@ This project builds upon the foundational work of several exceptional open-sourc
 - [**Flash Linear Attention**](https://github.com/fla-org/flash-linear-attention)
 
 
+### 📚 Citation
+
+If you use DTRNet in your research, please cite:
+
 ```
 @article{sharma2025dtrnet},
   title={SCOUT: Toward Sub-Quadratic Attention via Segment Compression for Optimized Utility in Transformers},
