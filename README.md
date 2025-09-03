@@ -3,6 +3,7 @@
 <img style="height:22pt" src="https://img.shields.io/badge/-Paper-red?style=flat&logo=arxiv"></a>
 <a target="_blank" href="https://github.com/ArefJafari/SCOUT">
 <img style="height:22pt" src="https://img.shields.io/badge/-Code-green?style=flat&logo=github"></a>
+
 ## Abstract
 
 **SCOUT** (Segment Compression for Optimized Utility in Transformers) is a hybrid long-sequence model that combines local mixing (via Mamba or sliding-window attention) with sparse attention over compressed checkpoints. Instead of attending to every past token, SCOUT compresses fixed-size segments into summary representations and only attends to these checkpoints. This design preserves much of the expressivity of full attention while scaling **sub-quadratically** in compute and memory.
