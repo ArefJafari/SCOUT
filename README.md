@@ -174,7 +174,7 @@ This project builds upon the foundational work of several exceptional open-sourc
 
 ### 📚 Citation
 
-If you use DTRNet in your research, please cite:
+If you use SCOUT in your research, please cite:
 
 ```
 @article{sharma2025dtrnet},
