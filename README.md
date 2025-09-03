@@ -1,5 +1,8 @@
-# SCOUT
-
+# SCOUT: Toward Sub-Quadratic Attention via Segment Compression for Optimized Utility in Transformers
+<a target="_blank" href="https://arxiv.org/pdf/2509.00935">
+<img style="height:22pt" src="https://img.shields.io/badge/-Paper-red?style=flat&logo=arxiv"></a>
+<a target="_blank" href="https://github.com/ArefJafari/SCOUT">
+<img style="height:22pt" src="https://img.shields.io/badge/-Code-green?style=flat&logo=github"></a>
 ## Abstract
 
 **SCOUT** (Segment Compression for Optimized Utility in Transformers) is a hybrid long-sequence model that combines local mixing (via Mamba or sliding-window attention) with sparse attention over compressed checkpoints. Instead of attending to every past token, SCOUT compresses fixed-size segments into summary representations and only attends to these checkpoints. This design preserves much of the expressivity of full attention while scaling **sub-quadratically** in compute and memory.
@@ -159,12 +162,23 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 lm_eval --model hf \
 
 This project builds upon the foundational work of several exceptional open-source initiatives. We gratefully acknowledge their contributions:
 
-- [**Samba**](https://github.com/state-spaces/samba)  
+- [**Samba**](https://github.com/microsoft/Samba)  
 
 - [**Lit-GPT**](https://github.com/Lightning-AI/lit-gpt)  
 
-- [**TinyLLaMA**](https://github.com/jasonwei20/tiny-llama)  
+- [**TinyLLaMA**](https://github.com/jzhang38/TinyLlama)  
 
-- [**Flash Linear Attention**](https://github.com/HazyResearch/flash-linear-attention)  
- 
+- [**Flash Linear Attention**](https://github.com/fla-org/flash-linear-attention)
+
+
+```
+@article{sharma2025dtrnet},
+  title={DTRNet: Dynamic Token Routing Network to Reduce Quadratic Costs in Transformers},
+  author={Sharma, Aman and Najafi, Saeed and Farinneya, Parsa and Jamialahmadi, Benyamin and S. Tahaei, Marzieh and Fan, Yuhe and Rezagholizadeh, Mehdi and Chen, Boxing and Jafari, Aref},
+  journal={arXiv preprint arXiv:2509.00925},
+  year={2025}
+}
+```
+
+
 
