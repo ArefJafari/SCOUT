@@ -177,7 +177,7 @@ This project builds upon the foundational work of several exceptional open-sourc
 If you use SCOUT in your research, please cite:
 
 ```
-@article{sharma2025dtrnet},
+@article{jafari2025scout},
   title={SCOUT: Toward Sub-Quadratic Attention via Segment Compression for Optimized Utility in Transformers},
   author={Jafari, Aref and Fan, Yuhe and Jamialahmadi, Benyamin and Farinneya, Parsa and Chen, Boxing and S. Tahaei, Marzieh},
   journal={arXiv preprint arXiv:2509.00935},
