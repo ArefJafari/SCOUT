@@ -3,7 +3,7 @@ import time
 import torch
 import argparse
 
-from scout_attention_triton_v2 import flash_attn_scout
+from scout_attention_triton_v2 import flash_attn_scout_auto
 
 
 @torch.no_grad()
@@ -87,11 +87,38 @@ def run_benchmark(B, H, T, D, sel_win, dtype_str, causal=True, drop_diag=True, d
     kself_btHD = k_btHD
     vself_btHD = v_btHD
 
-    tri_out_btHD = flash_attn_scout(
+    # Test both layouts with flash_attn_scout_auto
+    # Test (B,T,H,D) layout
+    tri_out_btHD = flash_attn_scout_auto(
         q_btHD, ksel_btHD, vsel_btHD, kself_btHD, vself_btHD,
         sel_positions, causal=causal, softmax_scale=scale, drop_diagonal=drop_diag,
     )
-    tri_out = tri_out_btHD.permute(0, 2, 1, 3).contiguous()
+    tri_out_btHD_to_bhtd = tri_out_btHD.permute(0, 2, 1, 3).contiguous()
+    
+    # Test (B,H,T,D) layout directly
+    if T >= sel_win:
+        k_sel_bhtd = k[:, :, sel_win-1::sel_win, :]
+        v_sel_bhtd = v[:, :, sel_win-1::sel_win, :]
+    else:
+        k_sel_bhtd = k.new_zeros(B, H, 0, D)
+        v_sel_bhtd = v.new_zeros(B, H, 0, D)
+    
+    tri_out_bhtd = flash_attn_scout_auto(
+        q, k_sel_bhtd, v_sel_bhtd, k, v,
+        sel_positions, causal=causal, softmax_scale=scale, drop_diagonal=drop_diag,
+    )
+    
+    # Verify both layouts produce the same results
+    layout_diff = (tri_out_btHD_to_bhtd - tri_out_bhtd).abs().max().item()
+    print(f"Layout consistency check (BTHD vs BHTD): max diff = {layout_diff:.6e}")
+    
+    if layout_diff > 1e-4:
+        print("WARNING: Different layouts produce different results!")
+    else:
+        print("✓ Both layouts produce consistent results")
+    
+    # Use the (B,H,T,D) result for comparison
+    tri_out = tri_out_bhtd
 
     diff = (tri_out - ref_out).float()
     max_abs  = diff.abs().max().item()
@@ -131,17 +158,53 @@ def run_benchmark(B, H, T, D, sel_win, dtype_str, causal=True, drop_diag=True, d
     
     # Timing
     def eager_call(): scout_swa_eager_forward(q, k, v, sel_win=sel_win, scale=scale, causal=causal, drop_diagonal=drop_diag)
-    def triton_call():
-        flash_attn_scout(q_btHD, ksel_btHD, vsel_btHD, kself_btHD, vself_btHD, sel_positions,
+    
+    def triton_bthd_call():
+        # Test (B,T,H,D) layout with reordering
+        q_btHD = q.permute(0, 2, 1, 3).contiguous()
+        k_btHD = k.permute(0, 2, 1, 3).contiguous()
+        v_btHD = v.permute(0, 2, 1, 3).contiguous()
+        if T >= sel_win:
+            ksel_btHD = k_btHD[:, sel_win-1::sel_win, :, :].contiguous()
+            vsel_btHD = v_btHD[:, sel_win-1::sel_win, :, :].contiguous()
+            sel_positions = torch.arange(sel_win - 1, T, sel_win, device=device, dtype=torch.int32)
+        else:
+            ksel_btHD = k_btHD[:, 0:0, :, :]
+            vsel_btHD = v_btHD[:, 0:0, :, :]
+            sel_positions = torch.empty(0, device=device, dtype=torch.int32)
+        kself_btHD = k_btHD
+        vself_btHD = v_btHD
+        
+        tri_out_btHD = flash_attn_scout_auto(q_btHD, ksel_btHD, vsel_btHD, kself_btHD, vself_btHD, sel_positions,
+                         causal=causal, softmax_scale=scale, drop_diagonal=drop_diag)
+        # Include the output reordering back to BHTD
+        tri_out = tri_out_btHD.permute(0, 2, 1, 3).contiguous()
+    
+    def triton_bhtd_call():
+        # Test (B,H,T,D) layout directly (no reordering needed)
+        if T >= sel_win:
+            k_sel_bhtd = k[:, :, sel_win-1::sel_win, :]
+            v_sel_bhtd = v[:, :, sel_win-1::sel_win, :]
+            sel_positions = torch.arange(sel_win - 1, T, sel_win, device=device, dtype=torch.int32)
+        else:
+            k_sel_bhtd = k.new_zeros(B, H, 0, D)
+            v_sel_bhtd = v.new_zeros(B, H, 0, D)
+            sel_positions = torch.empty(0, device=device, dtype=torch.int32)
+        
+        tri_out = flash_attn_scout_auto(q, k_sel_bhtd, v_sel_bhtd, k, v, sel_positions,
                          causal=causal, softmax_scale=scale, drop_diagonal=drop_diag)
 
     t_ref = time_op(eager_call, iters=iters, warmup=10)
-    t_tri = time_op(triton_call, iters=iters, warmup=10)
+    t_tri_bthd = time_op(triton_bthd_call, iters=iters, warmup=10)
+    t_tri_bhtd = time_op(triton_bhtd_call, iters=iters, warmup=10)
 
     print(f"Latency (avg over {iters} iters):")
-    print(f"  eager_ref : {t_ref:.3f} ms/iter")
-    print(f"  triton    : {t_tri:.3f} ms/iter")
-    print(f"  speedup   : {t_ref / max(t_tri, 1e-9):.2f}×")
+    print(f"  eager_ref     : {t_ref:.3f} ms/iter")
+    print(f"  triton (BTHD) : {t_tri_bthd:.3f} ms/iter")
+    print(f"  triton (BHTD) : {t_tri_bhtd:.3f} ms/iter")
+    print(f"  speedup (BTHD): {t_ref / max(t_tri_bthd, 1e-9):.2f}×")
+    print(f"  speedup (BHTD): {t_ref / max(t_tri_bhtd, 1e-9):.2f}×")
+    print(f"  BHTD vs BTHD  : {t_tri_bthd / max(t_tri_bhtd, 1e-9):.2f}×")
     
     # Return metrics for comparison across configurations
     return {
@@ -149,8 +212,11 @@ def run_benchmark(B, H, T, D, sel_win, dtype_str, causal=True, drop_diag=True, d
         'mean_diff': mean_abs,
         'rel_diff': mean_rel,
         'torch_time': t_ref,
-        'triton_time': t_tri,
-        'speedup': t_ref / max(t_tri, 1e-9)
+        'triton_bthd_time': t_tri_bthd,
+        'triton_bhtd_time': t_tri_bhtd,
+        'speedup_bthd': t_ref / max(t_tri_bthd, 1e-9),
+        'speedup_bhtd': t_ref / max(t_tri_bhtd, 1e-9),
+        'layout_ratio': t_tri_bthd / max(t_tri_bhtd, 1e-9)
     }
 
 
@@ -242,27 +308,29 @@ def main():
     
     # Summary of all configurations
     print("\n=== Summary of All Configurations ===")
-    print(f"{'Configuration':<15} {'Max Diff':<12} {'Mean Diff':<12} {'Rel Diff':<12} {'PyTorch (ms)':<12} {'Triton (ms)':<12} {'Speedup':<8}")
-    print("-" * 85)
+    print(f"{'Configuration':<15} {'Max Diff':<12} {'Mean Diff':<12} {'Rel Diff':<12} {'PyTorch (ms)':<12} {'Triton BTHD (ms)':<15} {'Triton BHTD (ms)':<15} {'Speedup BTHD':<12} {'Speedup BHTD':<12} {'Layout Ratio':<12}")
+    print("-" * 120)
     
     for config, metrics in results.items():
-        print(f"{config:<15} {metrics['max_diff']:<12.6e} {metrics['mean_diff']:<12.6e} {metrics['rel_diff']:<12.6e} {metrics['torch_time']:<12.3f} {metrics['triton_time']:<12.3f} {metrics['speedup']:<8.2f}×")
+        print(f"{config:<15} {metrics['max_diff']:<12.6e} {metrics['mean_diff']:<12.6e} {metrics['rel_diff']:<12.6e} {metrics['torch_time']:<12.3f} {metrics['triton_bthd_time']:<15.3f} {metrics['triton_bhtd_time']:<15.3f} {metrics['speedup_bthd']:<12.2f}× {metrics['speedup_bhtd']:<12.2f}× {metrics['layout_ratio']:<12.2f}×")
     
     # Find best and worst cases
     max_diff_config = max(results.items(), key=lambda x: x[1]['max_diff'])
     min_diff_config = min(results.items(), key=lambda x: x[1]['max_diff'])
-    max_speedup_config = max(results.items(), key=lambda x: x[1]['speedup'])
+    max_speedup_bthd_config = max(results.items(), key=lambda x: x[1]['speedup_bthd'])
+    max_speedup_bhtd_config = max(results.items(), key=lambda x: x[1]['speedup_bhtd'])
     
     print("\n=== Notable Results ===")
     print(f"Best numerical accuracy: {min_diff_config[0]} with max diff = {min_diff_config[1]['max_diff']:.6e}")
     print(f"Worst numerical accuracy: {max_diff_config[0]} with max diff = {max_diff_config[1]['max_diff']:.6e}")
-    print(f"Best speedup: {max_speedup_config[0]} with {max_speedup_config[1]['speedup']:.2f}× speedup")
+    print(f"Best speedup (BTHD): {max_speedup_bthd_config[0]} with {max_speedup_bthd_config[1]['speedup_bthd']:.2f}× speedup")
+    print(f"Best speedup (BHTD): {max_speedup_bhtd_config[0]} with {max_speedup_bhtd_config[1]['speedup_bhtd']:.2f}× speedup")
     
     # Generate visualizable data for further analysis
     print("\n=== Data for Visualization (CSV format) ===")
-    print("config,max_diff,mean_diff,rel_diff,torch_time,triton_time,speedup")
+    print("config,max_diff,mean_diff,rel_diff,torch_time,triton_bthd_time,triton_bhtd_time,speedup_bthd,speedup_bhtd,layout_ratio")
     for config, metrics in results.items():
-        print(f"{config},{metrics['max_diff']},{metrics['mean_diff']},{metrics['rel_diff']},{metrics['torch_time']},{metrics['triton_time']},{metrics['speedup']}")
+        print(f"{config},{metrics['max_diff']},{metrics['mean_diff']},{metrics['rel_diff']},{metrics['torch_time']},{metrics['triton_bthd_time']},{metrics['triton_bhtd_time']},{metrics['speedup_bthd']},{metrics['speedup_bhtd']},{metrics['layout_ratio']}")
 
 if __name__ == "__main__":
     main()

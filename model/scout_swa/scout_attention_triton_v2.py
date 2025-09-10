@@ -1,19 +1,31 @@
-# Forward-only Triton SCOUT attention that matches the eager ScoutSWA logic:
-# single softmax over [ self-item | selected grid ], causal on absolute positions,
-# optional drop-diagonal. Inputs use (B, T, H, D) to minimize transposes in the caller.
 
 import math
 import torch
 import triton
 import triton.language as tl
-
-
+@triton.autotune(
+    configs=[
+        # Keep tiling along Tq the same as your original (BLOCK_M=128).
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 32},  num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},  num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+    ],
+    key=["SEQLEN_Q", "SEQLEN_K", "HEADDIM"],  # cache fastest per shape
+)
+@triton.heuristics({
+    # Make sure we cover the full head dim. Next power of 2 (clamped) is fine.
+    "BLOCK_D": lambda META: 1 << int(math.ceil(math.log2(max(16, min(256, META["HEADDIM"]))))),
+})
 @triton.jit
-def _fwd_kernel_scout_exact(
-    Q, KSEL, VSEL, KSELF, VSELF, SELPOS,  # pointers
+def _fwd_kernel_scout(
+    Q, KSEL, VSEL, KSELF, VSELF, SELPOS,
     OUT, LSE,
-    SCALE,                                 # scalar float
-    # strides (for (B,T,H,D) layout)
+    SCALE,
+    # strides (B,T,H,D)
     stride_qb, stride_qh, stride_qm,
     stride_kb, stride_kh, stride_kn,
     stride_vb, stride_vh, stride_vn,
@@ -25,8 +37,7 @@ def _fwd_kernel_scout_exact(
     NHEADS, SEQLEN_Q, SEQLEN_K, SEQLEN_Q_ROUND, HEADDIM,
     # compile-time
     IS_CAUSAL: tl.constexpr, DROP_DIAG: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
-):
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,):   
     """
     Q:      (B, H, Tq, D)
     KSEL/VSEL:  (B, H, Tk, D)  -- grid selected KV
@@ -56,7 +67,7 @@ def _fwd_kernel_scout_exact(
     out_ptrs = OUT + b*stride_ob + h*stride_oh + (row_offs[:, None]*stride_om + d_offs[None, :])
     lse_ptrs = LSE + (b*NHEADS + h) * SEQLEN_Q_ROUND + row_offs
 
-    # Masks
+    # Masksl
     row_mask = row_offs < SEQLEN_Q
     d_mask   = d_offs   < HEADDIM
     mask2d   = (row_mask[:, None]) & (d_mask[None, :])
@@ -143,63 +154,133 @@ def _fwd_kernel_scout_exact(
     tl.store(lse_ptrs, (m_i + tl.log(l_i)), mask=row_mask)
 
 
-def flash_attn_scout(
-    q_btHD: torch.Tensor,       # (B, Tq, H, D)
-    ksel_btHD: torch.Tensor,    # (B, Tk, H, D)
-    vsel_btHD: torch.Tensor,    # (B, Tk, H, D)
-    kself_btHD: torch.Tensor,   # (B, Tq, H, D)
-    vself_btHD: torch.Tensor,   # (B, Tq, H, D)
+# def flash_attn_scout_bthd(
+#     q_btHD: torch.Tensor,       # (B, Tq, H, D)
+#     ksel_btHD: torch.Tensor,    # (B, Tk, H, D)
+#     vsel_btHD: torch.Tensor,    # (B, Tk, H, D)
+#     kself_btHD: torch.Tensor,   # (B, Tq, H, D)
+#     vself_btHD: torch.Tensor,   # (B, Tq, H, D)
+#     sel_positions: torch.Tensor,  # (Tk,) int32 absolute positions
+#     causal: bool = True,
+#     softmax_scale: float | None = None,
+#     drop_diagonal: bool = True,
+# ):
+#     """Forward-only SCOUT Triton kernel (returns (B, Tq, H, D))."""
+#     assert q_btHD.is_cuda, "CUDA tensor required"
+#     B, Tq, H, D = q_btHD.shape
+#     Tk = ksel_btHD.shape[1]
+#     assert vsel_btHD.shape == (B, Tk, H, D)
+#     assert kself_btHD.shape == (B, Tq, H, D)
+#     assert vself_btHD.shape == (B, Tq, H, D)
+#     assert sel_positions.shape[0] == Tk, "sel_positions must be length Tk"
+
+#     scale = (1.0 / math.sqrt(D)) if softmax_scale is None else float(softmax_scale)
+
+#     # contiguity for simple stride math
+#     q = q_btHD.contiguous()
+#     ks = ksel_btHD.contiguous()
+#     vs = vsel_btHD.contiguous()
+#     kS = kself_btHD.contiguous()
+#     vS = vself_btHD.contiguous()
+#     sel = sel_positions.contiguous().to(dtype=torch.int32, device=q.device)
+    
+    
+#     Tq_round = math.ceil(Tq / 128) * 128
+#     out = torch.empty_like(q)
+#     lse = torch.empty((B, H, Tq_round), device=q.device, dtype=torch.float32)
+
+#     # grid must use tuned BLOCK_M
+#     grid = lambda META: (triton.cdiv(Tq, META["BLOCK_M"]), B * H)
+
+#     _fwd_kernel_scout[grid](
+#         q, ks, vs, kS, vS, sel,
+#         out, lse,
+#         scale,
+#         q.stride(0), q.stride(2), q.stride(1),
+#         ks.stride(0), ks.stride(2), ks.stride(1),
+#         vs.stride(0), vs.stride(2), vs.stride(1),
+#         kS.stride(0), kS.stride(2), kS.stride(1),
+#         vS.stride(0), vS.stride(2), vS.stride(1),
+#         sel.stride(0),
+#         out.stride(0), out.stride(2), out.stride(1),
+#         H, Tq, Tk, Tq_round, D,
+#         IS_CAUSAL=causal,
+#         DROP_DIAG=drop_diagonal,
+#     )
+#     return out
+
+
+
+   
+def flash_attn_scout_bhtd(
+    q_bhTD: torch.Tensor,      # (B, H, Tq, D)
+    ksel_bhKD: torch.Tensor,   # (B, H, Tk, D)
+    vsel_bhKD: torch.Tensor,   # (B, H, Tk, D)
+    kself_bhTD: torch.Tensor,  # (B, H, Tq, D)
+    vself_bhTD: torch.Tensor,  # (B, H, Tq, D)
     sel_positions: torch.Tensor,  # (Tk,) int32 absolute positions
     causal: bool = True,
     softmax_scale: float | None = None,
     drop_diagonal: bool = True,
 ):
-    """Forward-only SCOUT Triton kernel (returns (B, Tq, H, D))."""
-    assert q_btHD.is_cuda, "CUDA tensor required"
-    B, Tq, H, D = q_btHD.shape
-    Tk = ksel_btHD.shape[1]
-    assert vsel_btHD.shape == (B, Tk, H, D)
-    assert kself_btHD.shape == (B, Tq, H, D)
-    assert vself_btHD.shape == (B, Tq, H, D)
-    assert sel_positions.shape[0] == Tk, "sel_positions must be length Tk"
+    """Forward-only SCOUT Triton kernel for (B, H, T, D) layout. Returns (B, H, T, D)."""
+    assert q_bhTD.is_cuda, "CUDA tensor required"
+    B, H, Tq, D = q_bhTD.shape
+    Bk, Hk, Tk, Dk = ksel_bhKD.shape
+    assert (Bk, Hk, Dk) == (B, H, D)
+    assert vsel_bhKD.shape == (B, H, Tk, D)
+    assert kself_bhTD.shape == (B, H, Tq, D)
+    assert vself_bhTD.shape == (B, H, Tq, D)
+    assert sel_positions.shape[0] == Tk
 
     scale = (1.0 / math.sqrt(D)) if softmax_scale is None else float(softmax_scale)
 
-    # contiguity for simple stride math
-    q = q_btHD.contiguous()
-    ks = ksel_btHD.contiguous()
-    vs = vsel_btHD.contiguous()
-    kS = kself_btHD.contiguous()
-    vS = vself_btHD.contiguous()
-    sel = sel_positions.contiguous().to(dtype=torch.int32, device=q.device)
+    # Use tensors as-is (no permute/contiguous needed). D is already the innermost dim.
+    q  = q_bhTD
+    ks = ksel_bhKD
+    vs = vsel_bhKD
+    kS = kself_bhTD
+    vS = vself_bhTD
+    sel = sel_positions.to(dtype=torch.int32, device=q.device)
 
     # outputs
     Tq_round = math.ceil(Tq / 128) * 128
-    out = torch.empty_like(q)
+    out = torch.empty_like(q)  # (B, H, Tq, D)
     lse = torch.empty((B, H, Tq_round), device=q.device, dtype=torch.float32)
 
-    # launch params
-    BLOCK_D = max(16, triton.next_power_of_2(D))
-    BLOCK_M = 128
-    BLOCK_N = 128
-    grid = (triton.cdiv(Tq, BLOCK_M), B * H)
+    # autotuned grid (BLOCK_M comes from META)
+    grid = lambda META: (triton.cdiv(Tq, META["BLOCK_M"]), B * H)
 
-    _fwd_kernel_scout_exact[grid](
+    _fwd_kernel_scout[grid](
+        # pointers
         q, ks, vs, kS, vS, sel,
         out, lse,
         scale,
-        # strides for (B,T,H,D)
-        q.stride(0), q.stride(2), q.stride(1),
-        ks.stride(0), ks.stride(2), ks.stride(1),
-        vs.stride(0), vs.stride(2), vs.stride(1),
-        kS.stride(0), kS.stride(2), kS.stride(1),
-        vS.stride(0), vS.stride(2), vS.stride(1),
+        # ---- STRIDES FOR (B, H, T, D) LAYOUT ----
+        # Q strides: qb, qh, qm  (m is T)
+        q.stride(0), q.stride(1), q.stride(2),
+        # KSEL strides: kb, kh, kn (n is Tk)
+        ks.stride(0), ks.stride(1), ks.stride(2),
+        # VSEL strides: vb, vh, vn
+        vs.stride(0), vs.stride(1), vs.stride(2),
+        # KSELF strides: kSb, kSh, kSm  (m is T)
+        kS.stride(0), kS.stride(1), kS.stride(2),
+        # VSELF strides: vSb, vSh, vSm
+        vS.stride(0), vS.stride(1), vS.stride(2),
+        # SELPOS stride
         sel.stride(0),
-        out.stride(0), out.stride(2), out.stride(1),
+        # OUT strides: ob, oh, om  (m is T)
+        out.stride(0), out.stride(1), out.stride(2),
+        # sizes
         H, Tq, Tk, Tq_round, D,
-        IS_CAUSAL=causal, DROP_DIAG=drop_diagonal,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
-        num_warps=(4 if D <= 64 else 8),
-        num_stages=1,
+        # constexpr
+        IS_CAUSAL=causal,
+        DROP_DIAG=drop_diagonal,
     )
     return out
+def flash_attn_scout(q, ksel, vsel, kself, vself, *args, **kw):
+    # If dim1 matches number of heads, it’s (B,H,T,D); otherwise (B,T,H,D).
+    #if q.shape[1] < q.shape[2]:  # H < T typically
+    return flash_attn_scout_bhtd(q, ksel, vsel, kself, vself, *args, **kw)
+    # else:
+    #     return flash_attn_scout_bthd(q, ksel, vsel, kself, vself, *args, **kw)  # your original B,T,H,D launcher

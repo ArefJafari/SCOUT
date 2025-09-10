@@ -264,57 +264,123 @@ def _has_padding(attn_mask: Optional[torch.Tensor]) -> bool:
         return False
 
 
+# def triton_sparse_attention_forward(
+#     module: nn.Module,
+#     query: torch.Tensor,  # [B,H,T,D]
+#     key: torch.Tensor,    # [B,HKV,T,D]
+#     value: torch.Tensor,  # [B,HKV,T,D]
+#     attention_mask: Optional[torch.Tensor],
+#     scaling: float,
+#     dropout: float = 0.0,
+#     **kwargs,
+# ):
+#     # If output_attentions required or padding exists -> fallback outside
+#     if kwargs.get("output_attentions", False):
+#         raise RuntimeError("triton_sparse_attention_forward does not return attn weights")
+
+#     # Expand KV heads (MQA/GQA -> MHA)
+#     key_states = repeat_kv(key, module.num_key_value_groups)     # [B,H,T,D]
+#     value_states = repeat_kv(value, module.num_key_value_groups) # [B,H,T,D]
+
+#     # To [B,T,H,D] for kernel
+#     q_btHD = query.transpose(1, 2).contiguous()
+#     k_btHD = key_states.transpose(1, 2).contiguous()
+#     v_btHD = value_states.transpose(1, 2).contiguous()
+
+#     B, T, H, D = q_btHD.shape
+#     sel = module.selection_window_size
+
+#     # Selected grid kv
+#     if T >= sel:
+#         ksel_btHD = k_btHD[:, sel - 1 :: sel, :, :].contiguous()
+#         vsel_btHD = v_btHD[:, sel - 1 :: sel, :, :].contiguous()
+#         sel_positions = torch.arange(sel - 1, T, sel, device=q_btHD.device, dtype=torch.int32)
+#     else:
+#         ksel_btHD = k_btHD[:, 0:0, :, :]
+#         vsel_btHD = v_btHD[:, 0:0, :, :]
+#         sel_positions = torch.empty(0, device=q_btHD.device, dtype=torch.int32)
+
+#     # Self kv are full (for the explicit diagonal term)
+#     kself_btHD = k_btHD
+#     vself_btHD = v_btHD
+#     # Causal always True in decoder
+#     out_btHD = flash_attn_scout(
+#         q_btHD, ksel_btHD, vsel_btHD, kself_btHD, vself_btHD,
+#         causal=True, sel_positions=sel_positions, drop_diagonal=True
+#     )  # [B,T,H,D]
+
+
+#     out_bHtD = out_btHD.transpose(1, 2).contiguous()  # [B,H,T,D]
+
+
+#     return out_bHtD.transpose(1, 2).contiguous().transpose(1, 2), None
+
+
+
+
 def triton_sparse_attention_forward(
     module: nn.Module,
-    query: torch.Tensor,  # [B,H,T,D]
-    key: torch.Tensor,    # [B,HKV,T,D]
-    value: torch.Tensor,  # [B,HKV,T,D]
+    query: torch.Tensor,  # [B, H, T, D]
+    key: torch.Tensor,    # [B, HKV, T, D]
+    value: torch.Tensor,  # [B, HKV, T, D]
     attention_mask: Optional[torch.Tensor],
     scaling: float,
     dropout: float = 0.0,
     **kwargs,
 ):
-    # If output_attentions required or padding exists -> fallback outside
+    """
+    Triton sparse attention forward using BHTD layout end-to-end.
+    Returns (out, None) where out is [B, H, T, D].
+    """
+    # Not supported in this forward-only path
     if kwargs.get("output_attentions", False):
         raise RuntimeError("triton_sparse_attention_forward does not return attn weights")
+    if dropout and dropout > 0:
+        raise RuntimeError("Dropout > 0 not supported in this Triton path")
+    if attention_mask is not None:
+        # This kernel path ignores attention_mask; caller should have baked causal/padding into selection.
+        # If you need it, integrate masking inside the kernel.
+        pass
 
-    # Expand KV heads (MQA/GQA -> MHA)
-    key_states = repeat_kv(key, module.num_key_value_groups)     # [B,H,T,D]
-    value_states = repeat_kv(value, module.num_key_value_groups) # [B,H,T,D]
+    # Expand KV heads (MQA/GQA -> MHA) to [B, H, T, D]
+    key_states   = repeat_kv(key,   module.num_key_value_groups)     # [B, H, T, D]
+    value_states = repeat_kv(value, module.num_key_value_groups)     # [B, H, T, D]
 
-    # To [B,T,H,D] for kernel
-    q_btHD = query.transpose(1, 2).contiguous()
-    k_btHD = key_states.transpose(1, 2).contiguous()
-    v_btHD = value_states.transpose(1, 2).contiguous()
+    # Shapes
+    B, H, T, D = query.shape
+    assert key_states.shape   == (B, H, T, D)
+    assert value_states.shape == (B, H, T, D)
 
-    B, T, H, D = q_btHD.shape
     sel = module.selection_window_size
 
-    # Selected grid kv
+    # Selected grid along time (Tk positions): every `sel` steps starting at sel-1
     if T >= sel:
-        ksel_btHD = k_btHD[:, sel - 1 :: sel, :, :].contiguous()
-        vsel_btHD = v_btHD[:, sel - 1 :: sel, :, :].contiguous()
-        sel_positions = torch.arange(sel - 1, T, sel, device=q_btHD.device, dtype=torch.int32)
+        ksel_bhKD = key_states[:, :, sel - 1 :: sel, :]    # [B, H, Tk, D]
+        vsel_bhKD = value_states[:, :, sel - 1 :: sel, :]  # [B, H, Tk, D]
+        sel_positions = torch.arange(sel - 1, T, sel, device=query.device, dtype=torch.int32)  # [Tk]
     else:
-        ksel_btHD = k_btHD[:, 0:0, :, :]
-        vsel_btHD = v_btHD[:, 0:0, :, :]
-        sel_positions = torch.empty(0, device=q_btHD.device, dtype=torch.int32)
+        # Empty selection (Tk=0)
+        ksel_bhKD = key_states[:, :, 0:0, :]               # [B, H, 0, D]
+        vsel_bhKD = value_states[:, :, 0:0, :]             # [B, H, 0, D]
+        sel_positions = torch.empty(0, device=query.device, dtype=torch.int32)
 
-    # Self kv are full (for the explicit diagonal term)
-    kself_btHD = k_btHD
-    vself_btHD = v_btHD
-    # Causal always True in decoder
-    out_btHD = flash_attn_scout(
-        q_btHD, ksel_btHD, vsel_btHD, kself_btHD, vself_btHD,
-        causal=True, sel_positions=sel_positions, drop_diagonal=True
-    )  # [B,T,H,D]
+    # Self KV are the full sequence (explicit diagonal term)
+    kself_bhTD = key_states    # [B, H, T, D]
+    vself_bhTD = value_states  # [B, H, T, D]
 
+    # Call the BHTD variant of the kernel (returns [B, H, T, D])
+    out_bhTD = flash_attn_scout(
+        q=query,
+        ksel=ksel_bhKD,
+        vsel=vsel_bhKD,
+        kself=kself_bhTD,
+        vself=vself_bhTD,
+        sel_positions=sel_positions,
+        causal=True,
+        drop_diagonal=True,
+    )
 
-    out_bHtD = out_btHD.transpose(1, 2).contiguous()  # [B,H,T,D]
-
-
-    return out_bHtD.transpose(1, 2).contiguous().transpose(1, 2), None
-
+    return out_bhTD, None
 
 
 # =========================
